@@ -1,5 +1,7 @@
 #pragma once
 #include <arduino.h>
+#include <interrupt_handler.h>	// Depends on interrupt_handler library
+
 
 /************************************************************
 
@@ -16,11 +18,8 @@ Usage:
 RotaryEncoder enc(data_pin, clk_pin, [optional] switch_pin);
 
 // declare interrupt handlers
-void rotary_handler() {
-	int dir;
-
-	// get rotation directon in dir if supplied (-1 CCW, 1 CW)
-	int value = enc.on_rotary_interrupt( &dir );
+void rotary_handler(int value int dir) {
+	// gets the current trackes value in value and the last direction in dir
 }
 
 void switch_handler() {
@@ -28,13 +27,13 @@ void switch_handler() {
 }
 
 setup() {
-	// start the encoder supplying interrupt handlers, switch handler optional
+	// start the encoder supplying interrupt handlers, switch handler optional but required if a switch pin has been supplied
 	enc.begin(rotary_handler, switch_handler);
 }
 
 loop() {
 	
-	// use value returned from enc.on_rotary_interrupt() or use
+	// use value returned from rotary_handler or use
 	// enc.get_value() to retrieve the last value
 }
 
@@ -50,62 +49,8 @@ loop() {
 #define DIRECT_PIN_WRITE_HIGH(base, mask) (*(base) |= (mask))
 #define DIRECT_PIN_WRITE_LOW(base, mask) (*(base) &= ~(mask))
 
-typedef void(*interrupt_handler)();
-
-static int pcint_mode[24] = {};
-volatile static int pcint_last[3] = {};
-volatile static interrupt_handler pcint_handler[24] = {};
-volatile uint8_t *port_to_pcmask[] = 
-{
-	&PCMSK0,
-	&PCMSK1,
-	&PCMSK2
-};
-
-void re_handle_interrupt(uint8_t port)
-{
-	//Serial.print("port: "); Serial.println(port);
-	
-	uint8_t curr = *portInputRegister(port + 2);
-	//Serial.print("curr: "); Serial.println(curr, 2);
-	//Serial.print("last: "); Serial.println(pcint_last[port], 2);
-	uint8_t mask = curr ^ pcint_last[port];
-	//Serial.print("mask: "); Serial.println(mask, 2);
-	pcint_last[port] = curr;
-	//Serial.print("port_to_pcmask: "); Serial.println(*port_to_pcmask[port], 2);
-
-	if((mask &= *port_to_pcmask[port]) == 0)
-		return;
-	//Serial.print("post mask: "); Serial.println(mask, 2);
-
-	for (uint8_t i = 0; i < 8; ++i) {
-		uint8_t bit = 1 << i;
-		if (bit & mask) {
-			uint8_t pin = port * 8 + i;
-			if ((pcint_mode[pin] == CHANGE) ||
-				((pcint_mode[pin] == FALLING) && !(curr & bit)) ||
-				((pcint_mode[pin] == RISING) && (curr & bit)) &&
-				(pcint_handler[pin] != nullptr)) {
-				pcint_handler[pin]();
-			}
-		}
-	}
-}
-
-ISR(PCINT0_vect)
-{
-	re_handle_interrupt(0);
-}
-
-ISR(PCINT1_vect)
-{
-	re_handle_interrupt(1);
-}
-
-ISR(PCINT2_vect)
-{
-	re_handle_interrupt(2);
-}
+typedef void(*rotary_callback)(int value, int dir);
+typedef void(*switch_callback)(void);
 
 class RotaryEncoder
 {
@@ -115,36 +60,15 @@ public:
 	{
 	}
 
-	void re_attachInterrupt(int pin, interrupt_handler handler, int mode)
-	{
-		if (digitalPinToInterrupt(pin) != NOT_AN_INTERRUPT) {
-			attachInterrupt(digitalPinToInterrupt(pin), handler, mode);
-		}
-		else {
-			uint8_t bit = digitalPinToBitMask(pin);
-			uint8_t port = digitalPinToPort(pin);
-			port -= 2;
-			volatile uint8_t *pcmask = port_to_pcmask[port];
-			int slot = (port == 1) ? (port * 8 + pin - 14) : (port * 8 + (pin % 8));
-
-			//Serial.println("registering on slot:"); Serial.println(slot);
-			pcint_mode[slot] = mode;
-			pcint_handler[slot] = handler;
-
-			*pcmask |= bit;
-			PCICR |= 1 << port;
-		}
-	}
-
-	void begin(interrupt_handler rotary_handler, interrupt_handler sw_handler = nullptr)
+	void begin(rotary_callback rotary_handler = nullptr, switch_callback sw_handler = nullptr)
 	{
 		_rotary_handler = rotary_handler;
-		_sw_handler = sw_handler;
+		_switch_handler = sw_handler;
 		
 		pinMode(_dt_pin, INPUT_PULLUP);
 		pinMode(_clk_pin, INPUT_PULLUP);
 
-		re_attachInterrupt(_dt_pin, _rotary_handler, CHANGE);
+		interrupt::attach_interrupt(_dt_pin, int_rotary_handler, CHANGE, this);
 
 		_dt_reg = PIN_TO_BASEREG(_dt_pin);
 		_dt_mask = PIN_TO_BITMASK(_dt_pin);
@@ -153,7 +77,7 @@ public:
 
 		if (_sw_pin != RE_UNUSED) {
 			pinMode(_sw_pin, INPUT_PULLUP);
-			re_attachInterrupt(_sw_pin, sw_handler, FALLING);
+			interrupt::attach_interrupt(_sw_pin, int_switch_handler, FALLING, this);
 		}
 	}
 
@@ -162,11 +86,16 @@ public:
 		return _value;
 	}
 
-	int on_rotary_interrupt(int *dir = nullptr)
+	void on_switch_interrupt()
 	{
-		if(dir)
-			*dir = 0;
+		if (_switch_handler) {
+			_switch_handler();
+		}
+	}
 
+	void on_rotary_interrupt()
+	{
+		int dir = 0;
 		int cur_dt = DIRECT_PIN_READ(_dt_reg, _dt_mask);
 		int cur_clk = DIRECT_PIN_READ(_clk_reg, _clk_mask);
 
@@ -177,19 +106,31 @@ public:
 				if (_prev_clk != cur_clk) {
 					if (_prev_clk) {
 						_value++;
-						if(dir) 
-							*dir = 1;
+						dir = 1;
 					}
 					else {
 						_value--;
-						if(dir) 
-							*dir = -1;
+						dir = -1;
 					}
 				}
 			}
 			_prev_dt = cur_dt;
 		}
-		return _value;
+		if (_rotary_handler) {
+			_rotary_handler(_value, dir);
+		}
+	}
+
+	static void int_rotary_handler(void *user_data)
+	{
+		RotaryEncoder *re = (RotaryEncoder*)user_data;
+		re->on_rotary_interrupt();
+	}
+
+	static void int_switch_handler(void *user_data)
+	{
+		RotaryEncoder *re = (RotaryEncoder*)user_data;
+		re->on_switch_interrupt();
 	}
 
 private:
@@ -204,8 +145,8 @@ private:
 	uint8_t _prev_dt = HIGH;
 
 	int _value;
-	interrupt_handler _rotary_handler;
-	interrupt_handler _sw_handler;
+	rotary_callback _rotary_handler;
+	switch_callback _switch_handler;
 };
 
 
